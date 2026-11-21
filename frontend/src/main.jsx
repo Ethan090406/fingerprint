@@ -1,17 +1,19 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
+import ExcelPanel from './ExcelPanel';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-const fingers = ['L1 - Thumb','L2 - Index','L3 - Middle','L4 - Ring','L5 - Little','R1 - Thumb','R2 - Index','R3 - Middle','R4 - Ring','R5 - Little'];
+const fingers = ['L1 - Thumb', 'L2 - Index', 'L3 - Middle', 'L4 - Ring', 'L5 - Little', 'R1 - Thumb', 'R2 - Index', 'R3 - Middle', 'R4 - Ring', 'R5 - Little'];
 
 function icon(type, size = 20) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round' };
-  if (type === 'finger') return <svg {...common}><path d="M7 14V8a5 5 0 0 1 10 0v6"/><path d="M5 15V9a7 7 0 0 1 14 0v6"/><path d="M3 14V10a9 9 0 0 1 18 0v5"/><path d="M9 16v-6a3 3 0 0 1 6 0v6"/><path d="M7 17c1.2 2.2 3.1 3 5 3s3.8-.8 5-3"/></svg>;
-  if (type === 'upload') return <svg {...common}><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M5 20h14"/></svg>;
-  if (type === 'check') return <svg {...common}><path d="m5 12 4 4L19 6"/></svg>;
-  if (type === 'download') return <svg {...common}><path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>;
-  if (type === 'refresh') return <svg {...common}><path d="M20 11a8 8 0 0 0-14.9-3"/><path d="M4 4v4h4"/><path d="M4 13a8 8 0 0 0 14.9 3"/><path d="M20 20v-4h-4"/></svg>;
+  if (type === 'finger') return <svg {...common}><path d="M7 14V8a5 5 0 0 1 10 0v6" /><path d="M5 15V9a7 7 0 0 1 14 0v6" /><path d="M3 14V10a9 9 0 0 1 18 0v5" /><path d="M9 16v-6a3 3 0 0 1 6 0v6" /><path d="M7 17c1.2 2.2 3.1 3 5 3s3.8-.8 5-3" /></svg>;
+  if (type === 'upload') return <svg {...common}><path d="M12 16V4" /><path d="m7 9 5-5 5 5" /><path d="M5 20h14" /></svg>;
+  if (type === 'check') return <svg {...common}><path d="m5 12 4 4L19 6" /></svg>;
+  if (type === 'download') return <svg {...common}><path d="M12 4v11" /><path d="m7 11 5 5 5-5" /><path d="M5 20h14" /></svg>;
+  if (type === 'refresh') return <svg {...common}><path d="M20 11a8 8 0 0 0-14.9-3" /><path d="M4 4v4h4" /><path d="M4 13a8 8 0 0 0 14.9 3" /><path d="M20 20v-4h-4" /></svg>;
+  if (type === 'edit') return <svg {...common}><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg>;
   return null;
 }
 
@@ -30,48 +32,248 @@ function fakeFingerprint(seed, coreX = 50, coreY = 46) {
   return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="240" height="180" viewBox="0 0 100 75"><rect width="100" height="75" fill="#f4f4f2"/>${paths.join('')}</svg>`)}`;
 }
 
-function DemoCard({ finger, i }) {
-  const patterns = ['Loop','Arch','Whorl','Loop','Accidental','Loop','Whorl','Loop','Arch','Loop'];
-  const rc = [14,0,16,12,11,15,17,13,0,14][i];
-  const core = {x: 49, y: 35};
-  const delta = {x: 72, y: 59};
-  return <ResultCard finger={finger} result={{pattern:patterns[i],ridge_count:rc,confidence:92+i%7,status:'success',core,delta,retry_attempted:false}} src={fakeFingerprint(i+1)} />;
+// Demo data (same values as before), now returned as plain result objects so they can be edited too.
+const DEMO_DIMS = { w: 100, h: 75 };
+function demoResult(i) {
+  const patterns = ['Loop', 'Arch', 'Whorl', 'Loop', 'Accidental', 'Loop', 'Whorl', 'Loop', 'Arch', 'Loop'];
+  const rc = [14, 0, 16, 12, 11, 15, 17, 13, 0, 14][i];
+  return { pattern: patterns[i], ridge_count: rc, confidence: 92 + i % 7, status: 'success', core: { x: 49, y: 35 }, delta: { x: 72, y: 59 }, retry_attempted: false };
 }
 
-function ResultCard({ finger, result, src }) {
+/* ---------- Ridge counting in the browser (used after manual core/delta placement) ---------- */
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+// Same idea as the backend's local_ridge_count: sample gray values along the core->delta line
+// and count dark ridge crossings. It is an estimate, so the editor also lets you type the count.
+async function countRidges(src, core, delta, w, h) {
+  const img = await loadImage(src);
+  const W = img.naturalWidth, H = img.naturalHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0);
+  const { data } = ctx.getImageData(0, 0, W, H);
+
+  const sx = W / w, sy = H / h;
+  const x1 = core.x * sx, y1 = core.y * sy, x2 = delta.x * sx, y2 = delta.y * sy;
+  const dist = Math.hypot(x2 - x1, y2 - y1);
+  if (dist < 8) return 0;
+
+  const n = Math.max(40, Math.floor(dist * 2.5));
+  let vals = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    const x = Math.min(W - 1, Math.max(0, Math.round(x1 + (x2 - x1) * t)));
+    const y = Math.min(H - 1, Math.max(0, Math.round(y1 + (y2 - y1) * t)));
+    const k = (y * W + x) * 4;
+    vals.push(0.299 * data[k] + 0.587 * data[k + 1] + 0.114 * data[k + 2]);
+  }
+
+  // light 5-tap smoothing
+  const wts = [1, 4, 6, 4, 1];
+  vals = vals.map((_, i) => {
+    let s = 0;
+    for (let j = -2; j <= 2; j++) s += vals[Math.min(vals.length - 1, Math.max(0, i + j))] * wts[j + 2];
+    return s / 16;
+  });
+
+  const trim = Math.max(3, Math.floor(n * 0.08));
+  if (vals.length > 2 * trim) vals = vals.slice(trim, vals.length - trim);
+
+  const sorted = [...vals].sort((a, b) => a - b);
+  const thr = sorted[Math.round(0.48 * (sorted.length - 1))];
+  const dark = vals.map(v => v < thr);
+  let runs = dark[0] ? 1 : 0;
+  for (let i = 1; i < dark.length; i++) if (dark[i] && !dark[i - 1]) runs++;
+  return Math.min(50, runs);
+}
+
+/* ---------- Result card ---------- */
+function ResultCard({ finger, result, src, onEdit }) {
   const w = result?.width || 100;
   const h = result?.height || 75;
   const cX = result?.core ? (result.core.x / w) * 100 : null;
   const cY = result?.core ? (result.core.y / h) * 100 : null;
   const dX = result?.delta ? (result.delta.x / w) * 100 : null;
   const dY = result?.delta ? (result.delta.y / h) * 100 : null;
+  const editable = !!src && !!onEdit;
 
   return (
     <article className="result-card">
-      <div className="finger-image-wrap">
-        {src ? <img src={src} alt={finger} className="finger-image"/> : <div className="no-image">No preview</div>}
+      <div
+        className={`finger-image-wrap ${editable ? 'editable' : ''}`}
+        // match the box to the image's real shape so C and D land exactly on the right spot
+        style={result?.width && result?.height ? { aspectRatio: `${result.width} / ${result.height}` } : undefined}
+        onClick={editable ? onEdit : undefined}
+        title={editable ? 'Click to set core and delta manually' : undefined}
+      >
+        {src ? <img src={src} alt={finger} className="finger-image" /> : <div className="no-image">No preview</div>}
 
-        {/* SVG overlay line connecting C and D exactly */}
         {cX != null && dX != null && (
-          <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{position:'absolute',top:0,left:0,width:'100%',height:'100%',pointerEvents:'none',zIndex:2}}>
-            <line x1={`${cX}%`} y1={`${cY}%`} x2={`${dX}%`} y2={`${dY}%`} stroke="#f2c900" strokeWidth="2.5" strokeDasharray="3 2"/>
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none', zIndex: 2 }}>
+            <line x1={`${cX}%`} y1={`${cY}%`} x2={`${dX}%`} y2={`${dY}%`} stroke="#f2c900" strokeWidth="2.5" strokeDasharray="3 2" />
           </svg>
         )}
 
-        {cX != null && <span className="marker core" style={{left:`${cX}%`, top:`${cY}%`, zIndex:3}}>C</span>}
-        {dX != null && <span className="marker delta" style={{left:`${dX}%`, top:`${dY}%`, zIndex:3}}>D</span>}
+        {cX != null && <span className="marker core" style={{ left: `${cX}%`, top: `${cY}%`, zIndex: 3 }}>C</span>}
+        {dX != null && <span className="marker delta" style={{ left: `${dX}%`, top: `${dY}%`, zIndex: 3 }}>D</span>}
+        {editable && <span className="edit-hint">{icon('edit', 13)} Adjust</span>}
       </div>
       <div className="card-body">
         <div className="finger-name">{finger}</div>
         <div className="chips"><span>RC: {result?.ridge_count ?? '—'}</span></div>
         <div className="confidence">
-          {result?.status === 'success'
-            ? <><span className="dot success-dot"/> {result.pattern} – {result.confidence}% confidence</>
-            : <><span className="dot warn-dot"/> Detection needs review</>
+          {result?.manual
+            ? <><span className="dot manual-dot" /> Manually corrected</>
+            : result?.status === 'success'
+              ? <><span className="dot success-dot" /> {result.pattern} – {result.confidence}% confidence</>
+              : <><span className="dot warn-dot" /> Detection needs review</>
           }
         </div>
+        {editable && (
+          <button className="adjust-btn" onClick={onEdit}>{icon('edit', 13)} Set core / delta</button>
+        )}
       </div>
     </article>
+  );
+}
+
+/* ---------- Manual core / delta editor ---------- */
+function FingerEditor({ finger, result, src, defaultDims, hasOverride, onSave, onRevert, onClose }) {
+  const stageRef = useRef(null);
+  const runId = useRef(0);
+
+  const [dims, setDims] = useState(result?.width && result?.height ? { w: result.width, h: result.height } : defaultDims);
+  const [core, setCore] = useState(result?.core || null);
+  const [delta, setDelta] = useState(result?.delta || null);
+  const [rc, setRc] = useState(result?.ridge_count ?? '');
+  const [rcTouched, setRcTouched] = useState(false);
+  const [mode, setMode] = useState('core');
+  const [counting, setCounting] = useState(false);
+  const [note, setNote] = useState('');
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  async function recompute(c, d, force = false) {
+    if (!c || !d || !dims || (rcTouched && !force)) return;
+    const id = ++runId.current;
+    setCounting(true); setNote('');
+    try {
+      const n = await countRidges(src, c, d, dims.w, dims.h);
+      if (id === runId.current) setRc(String(n));
+    } catch {
+      if (id === runId.current) setNote('Could not count automatically. Enter the ridge count yourself.');
+    } finally {
+      if (id === runId.current) setCounting(false);
+    }
+  }
+
+  function place(e) {
+    if (!dims || !stageRef.current) return;
+    const rect = stageRef.current.getBoundingClientRect();
+    const fx = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    const fy = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+    const p = { x: Math.round(fx * dims.w), y: Math.round(fy * dims.h) };
+    if (mode === 'core') {
+      setCore(p);
+      recompute(p, delta);
+      if (!delta) setMode('delta');
+    } else {
+      setDelta(p);
+      recompute(core, p);
+    }
+  }
+
+  function clearDelta() {
+    runId.current++;
+    setCounting(false); setDelta(null); setRc('0'); setRcTouched(false); setNote('');
+  }
+
+  function save() {
+    onSave({
+      core, delta,
+      width: dims?.w, height: dims?.h,
+      ridge_count: delta ? (rc === '' ? null : Number(rc)) : 0,
+      manual: true, status: 'success'
+    });
+  }
+
+  const cX = core && dims ? (core.x / dims.w) * 100 : null;
+  const cY = core && dims ? (core.y / dims.h) * 100 : null;
+  const dX = delta && dims ? (delta.x / dims.w) * 100 : null;
+  const dY = delta && dims ? (delta.y / dims.h) * 100 : null;
+
+  return (
+    <div className="editor-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="editor-modal" role="dialog" aria-modal="true" aria-label={`Adjust ${finger}`}>
+        <div className="editor-head">
+          <div>
+            <h3>{finger}</h3>
+            <p>{mode === 'core' ? 'Click the image to place the core (C).' : 'Click the image to place the delta (D).'} Click again to move it.</p>
+          </div>
+          <button className="editor-x" onClick={onClose} aria-label="Close">×</button>
+        </div>
+
+        <div className="editor-toolbar">
+          <div className="mode-switch">
+            <button className={`mode-btn core-mode ${mode === 'core' ? 'active' : ''}`} onClick={() => setMode('core')}>
+              <span className="marker-dot core" /> Set core
+            </button>
+            <button className={`mode-btn delta-mode ${mode === 'delta' ? 'active' : ''}`} onClick={() => setMode('delta')}>
+              <span className="marker-dot delta" /> Set delta
+            </button>
+          </div>
+          <button className="secondary small" onClick={clearDelta} disabled={!delta}>Remove delta (arch)</button>
+        </div>
+
+        <div className="editor-canvas">
+          <div className="editor-stage" ref={stageRef} onClick={place}>
+            <img
+              src={src} alt={finger} className="editor-img" draggable={false}
+              onLoad={(e) => { if (!dims) setDims({ w: e.target.naturalWidth, h: e.target.naturalHeight }); }}
+            />
+            {cX != null && dX != null && (
+              <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="editor-line">
+                <line x1={`${cX}%`} y1={`${cY}%`} x2={`${dX}%`} y2={`${dY}%`} stroke="#f2c900" strokeWidth="2.5" strokeDasharray="3 2" />
+              </svg>
+            )}
+            {cX != null && <span className="marker core" style={{ left: `${cX}%`, top: `${cY}%` }}>C</span>}
+            {dX != null && <span className="marker delta" style={{ left: `${dX}%`, top: `${dY}%` }}>D</span>}
+          </div>
+        </div>
+
+        <div className="editor-foot">
+          <div className="rc-field">
+            <label htmlFor="rc-input">Ridge count</label>
+            <input
+              id="rc-input" type="number" min="0" max="50" value={rc}
+              disabled={!delta}
+              onChange={(e) => { setRc(e.target.value); setRcTouched(true); }}
+            />
+            <button className="secondary small" disabled={!core || !delta || counting} onClick={() => { setRcTouched(false); recompute(core, delta, true); }}>
+              {counting ? 'Counting…' : 'Recount'}
+            </button>
+          </div>
+          {note && <div className="editor-note">{note}</div>}
+          <div className="editor-actions">
+            {hasOverride && <button className="secondary" onClick={onRevert}>Use auto-detected</button>}
+            <button className="secondary" onClick={onClose}>Cancel</button>
+            <button className="primary" disabled={!core} onClick={save}>Save changes</button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -216,7 +418,7 @@ function LearnerReport({ results, demo }) {
       <div className="report-cards-grid">
         {styles.map((s, idx) => (
           <div key={idx} className="learner-card">
-            <div className="learner-header" style={{backgroundColor: s.color}}>
+            <div className="learner-header" style={{ backgroundColor: s.color }}>
               {s.title}
             </div>
             <div className="learner-body">
@@ -233,7 +435,7 @@ function LearnerReport({ results, demo }) {
               <div className="learner-badge-col">
                 <div className="badge-box">
                   <div className="badge-type">{s.type}</div>
-                  <div className="badge-pct" style={{backgroundColor: s.color}}>{s.pct}%</div>
+                  <div className="badge-pct" style={{ backgroundColor: s.color }}>{s.pct}%</div>
                 </div>
               </div>
             </div>
@@ -252,6 +454,8 @@ function App() {
   const [error, setError] = useState('');
   const [demo, setDemo] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [overrides, setOverrides] = useState({}); // manual corrections, keyed by finger name
+  const [editing, setEditing] = useState(null);   // finger name currently open in the editor
 
   const urls = useMemo(() => files.map(f => URL.createObjectURL(f)), [files]);
 
@@ -269,6 +473,8 @@ function App() {
     setFiles(selected);
     setDemo(false);
     setResults(null);
+    setOverrides({});
+    setEditing(null);
     setError(validImages.length > 30 ? 'Only the first 30 images were selected.' : '');
   };
 
@@ -292,43 +498,52 @@ function App() {
     try {
       const form = new FormData();
       files.forEach(file => form.append('files', file));
-      const res = await fetch(`${API}/api/analyze`, { method:'POST', body:form });
+      const res = await fetch(`${API}/api/analyze`, { method: 'POST', body: form });
       if (!res.ok) throw new Error(await res.text());
       setResults(await res.json());
+      setOverrides({}); // fresh analysis replaces earlier manual fixes
     } catch (e) {
       setError('Backend is not reachable. Start the Python API on port 8000.');
     } finally { setLoading(false); }
   }
 
   function loadDemo() {
-    setDemo(true); setError(''); setResults({trc:125, finger_results:[]});
+    setDemo(true); setError(''); setResults({ trc: 125, finger_results: [] }); setOverrides({}); setEditing(null);
   }
 
   function resetAll() {
-    setFiles([]); setResults(null); setDemo(false); setError('');
+    setFiles([]); setResults(null); setDemo(false); setError(''); setOverrides({}); setEditing(null);
     if (inputRef.current) inputRef.current.value = '';
   }
 
   const selected = results?.finger_results || [];
   const selectedByFinger = Object.fromEntries(selected.map(r => [r.finger, r]));
 
-  function exportExcel() {
-    const list = demo
-      ? [
-          { finger: 'L1 - Thumb', pattern: 'Loop', ridge_count: 14, confidence: 92 },
-          { finger: 'L2 - Index', pattern: 'Arch', ridge_count: 0, confidence: 93 },
-          { finger: 'L3 - Middle', pattern: 'Whorl', ridge_count: 16, confidence: 94 },
-          { finger: 'L4 - Ring', pattern: 'Loop', ridge_count: 12, confidence: 95 },
-          { finger: 'L5 - Little', pattern: 'Accidental', ridge_count: 11, confidence: 96 },
-          { finger: 'R1 - Thumb', pattern: 'Loop', ridge_count: 15, confidence: 97 },
-          { finger: 'R2 - Index', pattern: 'Whorl', ridge_count: 17, confidence: 98 },
-          { finger: 'R3 - Middle', pattern: 'Loop', ridge_count: 13, confidence: 92 },
-          { finger: 'R4 - Ring', pattern: 'Arch', ridge_count: 0, confidence: 93 },
-          { finger: 'R5 - Little', pattern: 'Loop', ridge_count: 14, confidence: 94 }
-        ]
-      : selected;
+  // Auto-detected result per finger (demo or real), then the manual correction layered on top.
+  const baseFor = (finger, i) => demo ? demoResult(i) : selectedByFinger[finger];
+  const effectiveFor = (finger, i) => {
+    const base = baseFor(finger, i);
+    const ov = overrides[finger];
+    if (!base && !ov) return undefined;
+    return { finger, ...(base || {}), ...(ov || {}) };
+  };
+  const srcFor = (finger, i) => {
+    if (demo) return fakeFingerprint(i + 1);
+    const idx = selectedByFinger[finger]?.index;
+    return idx != null ? urls[idx] : null;
+  };
 
-    const trcValue = demo ? 125 : (results?.trc ?? 0);
+  // TRC = backend total, adjusted by whatever manual corrections changed.
+  const baseTrc = demo ? 125 : (results?.trc ?? 0);
+  const trcValue = baseTrc + fingers.reduce((sum, finger, i) => {
+    if (!overrides[finger]) return sum;
+    const before = baseFor(finger, i)?.ridge_count;
+    const after = overrides[finger].ridge_count;
+    return sum + (Number.isInteger(after) ? after : 0) - (Number.isInteger(before) ? before : 0);
+  }, 0);
+
+  function exportExcel() {
+    const list = fingers.map((f, i) => effectiveFor(f, i)).filter(Boolean);
 
     let csvContent = '\uFEFF';
     csvContent += 'FINGERPRINT ANALYSIS & DMIT REPORT\n';
@@ -340,8 +555,8 @@ function App() {
       const f = `"${item.finger || ''}"`;
       const p = `"${item.pattern || ''}"`;
       const rc = item.ridge_count != null ? item.ridge_count : '—';
-      const c = item.confidence != null ? `${item.confidence}%` : '—';
-      const st = `"${item.status || 'success'}"`;
+      const c = item.manual ? 'manual' : (item.confidence != null ? `${item.confidence}%` : '—');
+      const st = `"${item.manual ? 'manually corrected' : (item.status || 'success')}"`;
       const fn = `"${item.filename || ''}"`;
       csvContent += `${f},${p},${rc},${c},${st},${fn}\n`;
     });
@@ -361,11 +576,13 @@ function App() {
     a.click();
   }
 
+  const editingIndex = editing ? fingers.indexOf(editing) : -1;
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">{icon('finger', 42)}<div><h1>Fingerprint Analyzer</h1><p>Core, delta &amp; ridge count prototype</p></div></div>
-        <div className="prototype"><span/> Prototype</div>
+        <div className="prototype"><span /> Prototype</div>
       </header>
 
       <main>
@@ -381,7 +598,7 @@ function App() {
             <div className="upload-icon">{icon('upload', 30)}</div>
             <h2>{isDragging ? 'Drop images here' : 'Upload or Drag & Drop fingerprint images'}</h2>
             <p>JPG, PNG or BMP · Drag and drop or browse · up to 30 images</p>
-            <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/bmp,.bmp" multiple onChange={onFiles} hidden/>
+            <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/bmp,.bmp" multiple onChange={onFiles} hidden />
             {files.length > 0 && <div className="file-count">{files.length} image{files.length !== 1 ? 's' : ''} ready</div>}
           </div>
           <div className="actions">
@@ -395,30 +612,33 @@ function App() {
         {(files.length || demo || results) ? (
           <section className="results-section">
             <div className="section-head">
-              <div><h2>Ten-finger results</h2><p>{demo ? 'Demo data · replace with real uploads' : `${files.length} uploaded images · best result selected for each finger`}</p></div>
-              <button className="icon-button" onClick={exportExcel}>{icon('download',18)} Export Excel</button>
+              <div><h2>Ten-finger results</h2><p>{demo ? 'Demo data · replace with real uploads' : `${files.length} uploaded images · best result selected for each finger`}{results && ' · click an image to set core and delta manually'}</p></div>
+              <button className="icon-button" onClick={exportExcel}>{icon('download', 18)} Export Excel</button>
             </div>
 
             <div className="grid">
-              {fingers.map((finger,i) => {
-                const r = selectedByFinger[finger];
-                if (demo) return <DemoCard key={finger} finger={finger} i={i}/>;
-                const sourceIndex = r?.index;
-                return <ResultCard key={finger} finger={finger} result={r} src={sourceIndex != null ? urls[sourceIndex] : null}/>;
-              })}
+              {fingers.map((finger, i) => (
+                <ResultCard
+                  key={finger}
+                  finger={finger}
+                  result={effectiveFor(finger, i)}
+                  src={srcFor(finger, i)}
+                  onEdit={() => setEditing(finger)}
+                />
+              ))}
             </div>
 
             <div className="trc-bar">
               <div><div className="trc-label">Total Ridge Count (TRC)</div><div className="trc-note">Sum of the ten selected ridge counts</div></div>
-              <div className="trc-value">{demo ? 125 : (results?.trc ?? '—')}</div>
-              <button className="primary" onClick={exportExcel}>{icon('download',17)} Export Excel (.csv)</button>
+              <div className="trc-value">{results ? trcValue : '—'}</div>
+              <button className="primary" onClick={exportExcel}>{icon('download', 17)} Export Excel (.csv)</button>
             </div>
-
+            <ExcelPanel rows={fingers.map((f, i) => effectiveFor(f, i))} />
             <LearnerReport results={results} demo={demo} />
           </section>
         ) : (
           <section className="empty">
-            <div>{icon('finger',38)}</div>
+            <div>{icon('finger', 38)}</div>
             <h2>Ready for fingerprints</h2>
             <p>Upload up to 30 images to analyze core, delta and ridge count.</p>
           </section>
@@ -426,6 +646,20 @@ function App() {
 
         <footer>Prototype only · Detection is heuristic and must be validated against labeled fingerprint examples before production use.</footer>
       </main>
+
+      {editing && srcFor(editing, editingIndex) && (
+        <FingerEditor
+          key={editing}
+          finger={editing}
+          result={effectiveFor(editing, editingIndex)}
+          src={srcFor(editing, editingIndex)}
+          defaultDims={demo ? DEMO_DIMS : null}
+          hasOverride={!!overrides[editing]}
+          onClose={() => setEditing(null)}
+          onSave={(patch) => { setOverrides(o => ({ ...o, [editing]: patch })); setEditing(null); }}
+          onRevert={() => { setOverrides(o => { const n = { ...o }; delete n[editing]; return n; }); setEditing(null); }}
+        />
+      )}
     </div>
   );
 }

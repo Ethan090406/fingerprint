@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import math
 from typing import List
 
@@ -9,7 +8,7 @@ import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Fingerprint Analyzer API", version="0.3.0")
+app = FastAPI(title="Fingerprint Analyzer API", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,320 +31,369 @@ def decode_image(data: bytes) -> np.ndarray:
     return img
 
 
-def enhance(gray: np.ndarray) -> np.ndarray:
+# ---------------------------------------------------------------- basics
+def enhance(gray):
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    out = clahe.apply(gray)
-    return cv2.GaussianBlur(out, (3, 3), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
 
 
-def extract_fingerprint_mask(gray: np.ndarray, block_size: int = 16) -> np.ndarray:
-    """
-    Computes a binary foreground mask of the actual friction ridge pattern,
-    completely eliminating black borders and unprinted white zones.
-    """
+def estimate_ridge_period(gray, mask):
+    """Dominant ridge period (px) from the FFT of the most textured central window."""
     h, w = gray.shape
-    # Local variance filter
-    mean = cv2.blur(gray.astype(np.float32), (block_size, block_size))
-    sq_mean = cv2.blur((gray.astype(np.float32)) ** 2, (block_size, block_size))
-    variance = sq_mean - (mean ** 2)
-    variance = np.clip(variance, 0, None)
-    std = np.sqrt(variance)
-
-    thresh = np.percentile(std, 30)
-    thresh = max(10.0, float(thresh))
-    mask = (std > thresh).astype(np.uint8) * 255
-
-    # Morphological clean up: erode to stay strictly away from the border edge
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(block_size * 1.5), int(block_size * 1.5)))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_small)
-    mask = cv2.erode(mask, kernel_erode)
-    return mask
-
-
-def orientation_field(gray: np.ndarray, block: int = 12):
-    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    h, w = gray.shape
-    hh, ww = h // block, w // block
-
-    Gxx = np.zeros((hh, ww), dtype=np.float64)
-    Gyy = np.zeros((hh, ww), dtype=np.float64)
-    Gxy = np.zeros((hh, ww), dtype=np.float64)
-    energy = np.zeros((hh, ww), dtype=np.float64)
-
-    for y in range(hh):
-        ys = slice(y * block, (y + 1) * block)
-        for x in range(ww):
-            xs = slice(x * block, (x + 1) * block)
-            bx = gx[ys, xs]
-            by = gy[ys, xs]
-            Gxx[y, x] = np.sum(bx * bx)
-            Gyy[y, x] = np.sum(by * by)
-            Gxy[y, x] = np.sum(bx * by)
-            energy[y, x] = np.mean(bx * bx + by * by)
-
-    sin2 = cv2.GaussianBlur(2.0 * Gxy, (7, 7), 2.0)
-    cos2 = cv2.GaussianBlur(Gxx - Gyy, (7, 7), 2.0)
-
-    theta = 0.5 * np.arctan2(sin2, cos2) + (np.pi / 2.0)
-    coherence = np.sqrt(sin2 * sin2 + cos2 * cos2) / (Gxx + Gyy + 1e-6)
-    return theta, energy, coherence, block
-
-
-def wrapped_delta(a: float, b: float) -> float:
-    d = a - b
-    while d > math.pi / 2.0:
-        d -= math.pi
-    while d < -math.pi / 2.0:
-        d += math.pi
-    return d
-
-
-def find_singularities(theta: np.ndarray, mask_block: np.ndarray, energy: np.ndarray, coherence: np.ndarray):
-    """
-    Computes Poincare index ONLY on valid interior friction ridge blocks.
-    """
-    hh, ww = theta.shape
-    candidates = []
-
-    for y in range(2, hh - 2):
-        for x in range(2, ww - 2):
-            # Check 3x3 neighbourhood is 100% inside fingerprint mask
-            if not np.all(mask_block[y - 1:y + 2, x - 1:x + 2]):
+    win = int(min(160, min(h, w) // 2))
+    win -= win % 2
+    ys, xs = np.nonzero(mask)
+    if len(ys) == 0:
+        return 8.0
+    cy, cx = int(np.median(ys)), int(np.median(xs))
+    ests = []
+    for dy in (-win // 2, 0, win // 2):
+        for dx in (-win // 2, 0, win // 2):
+            y0 = int(np.clip(cy + dy - win // 2, 0, h - win))
+            x0 = int(np.clip(cx + dx - win // 2, 0, w - win))
+            m = mask[y0:y0 + win, x0:x0 + win]
+            if m.mean() < 0.9:
                 continue
-            if coherence[y, x] < 0.20:
+            patch = gray[y0:y0 + win, x0:x0 + win].astype(np.float32)
+            patch = cv2.GaussianBlur(patch, (0, 0), 1.0) - cv2.GaussianBlur(patch, (0, 0), 9.0)
+            patch *= np.outer(np.hanning(win), np.hanning(win)).astype(np.float32)
+            spec = np.abs(np.fft.fftshift(np.fft.fft2(patch))) ** 2
+            yy, xx = np.indices(spec.shape)
+            r = np.hypot(yy - win // 2, xx - win // 2)
+            lo, hi = win / 20.0, win / 5.0           # periods 20 .. 5 px
+            sel = (r >= lo) & (r <= hi)
+            if not sel.any():
                 continue
-
-            # 8-connected loop
-            angles = [
-                theta[y - 1, x - 1], theta[y - 1, x], theta[y - 1, x + 1],
-                theta[y, x + 1], theta[y + 1, x + 1], theta[y + 1, x],
-                theta[y + 1, x - 1], theta[y, x - 1]
-            ]
-            total_delta = sum(wrapped_delta(angles[(i + 1) % 8], angles[i]) for i in range(8))
-            poincare_val = total_delta / math.pi
-
-            if abs(poincare_val) >= 0.35:
-                is_core = poincare_val > 0
-                quality = 1.0 - min(abs(abs(poincare_val) - 0.5), abs(abs(poincare_val) - 1.0))
-                candidates.append((x, y, is_core, quality, float(energy[y, x]), float(coherence[y, x])))
-
-    return candidates
+            rb = np.round(r[sel]).astype(int)
+            prof = np.bincount(rb, weights=spec[sel])
+            cnt = np.bincount(rb)
+            prof = prof / np.maximum(cnt, 1)
+            k = int(np.argmax(prof))
+            if k <= 0:
+                continue
+            # peak must stand out from the rest of the band
+            if prof[k] < 2.0 * float(np.median(prof[prof > 0])):
+                continue
+            ests.append(win / k)
+    if not ests:
+        return 8.0
+    return float(np.clip(np.median(ests), 5.5, 20.0))
 
 
-def dedupe_singularities(points, min_dist=3):
-    points = sorted(points, key=lambda p: p[3] * p[4], reverse=True)
+def foreground_mask(gray, p):
+    g = gray.astype(np.float32)
+    k = max(3, int(round(p * 1.5)) | 1)
+    mean = cv2.blur(g, (k, k))
+    sq = cv2.blur(g * g, (k, k))
+    std = np.sqrt(np.clip(sq - mean * mean, 0, None))
+    std8 = cv2.normalize(std, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    t, _ = cv2.threshold(std8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = (std8 > max(8, 0.6 * t)).astype(np.uint8) * 255
+    ks = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(p * 2) | 1, int(p * 2) | 1))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ks)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ks)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(mask)
+    if n > 1:
+        big = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        mask = (lab == big).astype(np.uint8) * 255
+    # fill holes (pad first so the flood fill always starts on background)
+    h, w = mask.shape
+    pad = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    ff = cv2.bitwise_not(pad)
+    cv2.floodFill(ff, np.zeros((h + 4, w + 4), np.uint8), (0, 0), 0)
+    mask = (pad | ff)[1:-1, 1:-1]
+    return mask > 0
+
+
+# ---------------------------------------------------------------- orientation
+def orientation_field(gray, p):
+    g = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), max(0.8, 0.25 * p))
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    sw = max(2.0, 1.1 * p)
+    Jxx = cv2.GaussianBlur(gx * gx, (0, 0), sw)
+    Jyy = cv2.GaussianBlur(gy * gy, (0, 0), sw)
+    Jxy = cv2.GaussianBlur(gx * gy, (0, 0), sw)
+    c2 = Jxx - Jyy
+    s2 = 2.0 * Jxy
+    mag = np.sqrt(c2 * c2 + s2 * s2)
+    coh = mag / (Jxx + Jyy + 1e-6)
+    # unit doubled-angle vectors, smoothed once more so noise does not make fake singularities
+    ux = cv2.GaussianBlur(c2 / (mag + 1e-6), (0, 0), max(1.5, 0.8 * p))
+    uy = cv2.GaussianBlur(s2 / (mag + 1e-6), (0, 0), max(1.5, 0.8 * p))
+    theta = 0.5 * np.arctan2(uy, ux) + math.pi / 2.0      # ridge direction, mod pi
+    return theta, coh
+
+
+def wrap(d):
+    return (d + math.pi / 2.0) % math.pi - math.pi / 2.0
+
+
+def poincare_map(theta, coh, mask, radius, ys, xs, n=16, coh_min=0.22):
+    h, w = theta.shape
+    ang = np.arange(n) * 2 * math.pi / n
+    oy = np.round(radius * np.sin(ang)).astype(int)
+    ox = np.round(radius * np.cos(ang)).astype(int)
+    yy, xx = np.meshgrid(ys, xs, indexing="ij")
+    yy, xx = yy.ravel(), xx.ravel()
+    ring_y = yy[:, None] + oy[None, :]
+    ring_x = xx[:, None] + ox[None, :]
+    th = theta[ring_y, ring_x]
+    d = wrap(np.roll(th, -1, axis=1) - th)
+    idx = d.sum(axis=1) / (2 * math.pi)
+    inside = mask[ring_y, ring_x].mean(axis=1) >= 0.999
+    inside &= mask[yy, xx]
+    ring_coh = coh[ring_y, ring_x].mean(axis=1)
+    ok = inside & (ring_coh >= coh_min)
+    out = np.zeros((len(ys), len(xs)), np.float32)
+    okm = np.zeros_like(out, dtype=bool)
+    out[:] = idx.reshape(out.shape)
+    okm[:] = ok.reshape(out.shape)
+    return out, okm
+
+
+def find_singularities(theta, coh, mask, p, relaxed=False):
+    step = max(2, int(round(p / 2)))
+    R1 = max(6, int(round(2.2 * p)))
+    R2 = max(9, int(round(3.4 * p)))
+    cm = 0.15 if relaxed else 0.22
+    th_i = 0.30 if relaxed else 0.38
+    h, w = theta.shape
+    m = R2 + 2
+    ys = np.arange(m, h - m, step)
+    xs = np.arange(m, w - m, step)
+    i1, ok1 = poincare_map(theta, coh, mask, R1, ys, xs, coh_min=cm)
+    i2, ok2 = poincare_map(theta, coh, mask, R2, ys, xs, coh_min=cm)
+    # use the bigger ring where valid, otherwise the small one
+    cands = []
+    for a in range(len(ys)):
+        for b in range(len(xs)):
+            v1 = i1[a, b] if ok1[a, b] else None
+            v2 = i2[a, b] if ok2[a, b] else None
+            vals = [v for v in (v1, v2) if v is not None]
+            if not vals:
+                continue
+            if v1 is not None and v2 is not None:
+                if np.sign(v1) != np.sign(v2):
+                    continue
+                v = min(abs(v1), abs(v2)) * np.sign(v1)
+                strength = min(abs(v1), abs(v2))
+            else:
+                v = vals[0]
+                strength = abs(v) * 0.8
+            if abs(v) < th_i:
+                continue
+            cands.append((int(xs[b]), int(ys[a]), 1 if v > 0 else -1, float(strength), float(coh[ys[a], xs[b]])))
+    return cands, R1
+
+
+def cluster(cands, sign, dist):
+    pts = sorted([c for c in cands if c[2] == sign], key=lambda c: c[3], reverse=True)
     out = []
-    for p in points:
-        if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 >= min_dist ** 2 for q in out):
-            out.append(p)
-    return out
+    for c in pts:
+        for o in out:
+            if math.hypot(c[0] - o["x"], c[1] - o["y"]) <= dist:
+                o["members"].append(c)
+                break
+        else:
+            out.append({"x": c[0], "y": c[1], "members": [c]})
+    res = []
+    for o in out:
+        m = o["members"]
+        wsum = sum(k[3] for k in m)
+        x = sum(k[0] * k[3] for k in m) / wsum
+        y = sum(k[1] * k[3] for k in m) / wsum
+        res.append({"x": x, "y": y, "n": len(m), "strength": max(k[3] for k in m)})
+    # a real singularity lights up several neighbouring grid points
+    return [r for r in res if r["n"] >= 2]
 
 
-def local_ridge_count(gray: np.ndarray, core, delta) -> int:
+def multiscale_singularities(gray, mask, p0, scales=(0.75, 1.0, 1.33)):
+    """Run the detector at several scales and keep singularities seen at >= 2 of them."""
+    found = {+1: [], -1: []}
+    for sc in scales:
+        p = p0 * sc
+        theta, coh = orientation_field(gray, p)
+        cands, _ = find_singularities(theta, coh, mask, p)
+        for sign in (+1, -1):
+            for c in cluster(cands, sign, 3.0 * p):
+                found[sign].append(c)
+    out = {}
+    for sign in (+1, -1):
+        groups = []
+        for c in sorted(found[sign], key=lambda c: c["strength"], reverse=True):
+            for g in groups:
+                if math.hypot(c["x"] - g["x"], c["y"] - g["y"]) <= 3.5 * p0:
+                    g["m"].append(c)
+                    break
+            else:
+                groups.append({"x": c["x"], "y": c["y"], "m": [c]})
+        res = []
+        for g in groups:
+            if len(g["m"]) < 2:
+                continue
+            res.append({"x": float(np.mean([k["x"] for k in g["m"]])),
+                        "y": float(np.mean([k["y"] for k in g["m"]])),
+                        "n": len(g["m"]),
+                        "strength": float(np.mean([k["strength"] for k in g["m"]]))})
+        out[sign] = res
+    return out[+1], out[-1]
+
+
+# ---------------------------------------------------------------- ridge counting
+def ridge_count(gray, core, delta, p):
     x1, y1 = core
     x2, y2 = delta
     dist = math.hypot(x2 - x1, y2 - y1)
-    if dist < 8:
+    if dist < 2 * p:
         return 0
+    n = max(40, int(dist * 2))
+    xs = np.linspace(x1, x2, n).astype(np.float32)
+    ys = np.linspace(y1, y2, n).astype(np.float32)
+    vals = cv2.remap(gray.astype(np.float32), xs.reshape(1, -1), ys.reshape(1, -1), cv2.INTER_LINEAR).reshape(-1)
+    spp = n / dist                                    # samples per pixel
+    vals = cv2.GaussianBlur(vals.reshape(1, -1), (0, 0), sigmaX=max(0.8, 0.12 * p * spp)).reshape(-1)
+    trend = cv2.GaussianBlur(vals.reshape(1, -1), (0, 0), sigmaX=max(3.0, 1.2 * p * spp)).reshape(-1)
+    v = vals - trend
+    trim = int(0.6 * p * spp)                         # do not count the ridges at the core / delta themselves
+    v = v[trim:len(v) - trim]
+    if len(v) < 5:
+        return 0
+    thr = 0.25 * float(np.std(v))
+    state, runs = 0, 0
+    for s in v:
+        if state <= 0 and s > thr:
+            state = 1
+            runs += 1
+        elif state >= 0 and s < -thr:
+            state = -1
+    return int(min(50, runs))
 
-    num_samples = max(40, int(dist * 2.5))
-    xs = np.linspace(x1, x2, num_samples)
-    ys = np.linspace(y1, y2, num_samples)
+
+# ---------------------------------------------------------------- main entry
+def analyze(gray_full, filename):
+    H, W = gray_full.shape
+    scale = min(1.0, 700.0 / max(H, W))
+    gray = cv2.resize(gray_full, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else gray_full
     h, w = gray.shape
-    xi = np.clip(np.rint(xs).astype(int), 0, w - 1)
-    yi = np.clip(np.rint(ys).astype(int), 0, h - 1)
+    enh = enhance(gray)
 
-    vals = gray[yi, xi].astype(np.float32)
-    vals = cv2.GaussianBlur(vals.reshape(1, -1), (1, 5), 0).reshape(-1)
-
-    trim = max(3, int(num_samples * 0.08))
-    if len(vals) > 2 * trim:
-        vals = vals[trim:-trim]
-
-    threshold = float(np.percentile(vals, 48))
-    dark = vals < threshold
-    runs = int(np.sum(dark[1:] & ~dark[:-1])) + (1 if len(dark) and dark[0] else 0)
-    return max(0, min(50, runs))
-
-
-def detect_triradius_by_triplet(theta: np.ndarray, mask_block: np.ndarray, core_bx: int, core_by: int):
-    """
-    Direct triradius detection: A true delta is formed by three converging ridge directions
-    spaced ~120 degrees apart (pi/3). Finds the triradius with highest delta symmetry.
-    """
-    hh, ww = theta.shape
-    best_pt = None
-    best_score = -1e9
-
-    for y in range(3, hh - 3):
-        for x in range(3, ww - 3):
-            if not mask_block[y, x]:
-                continue
-            # Must be lower than or near level with core
-            if y < core_by - 1:
-                continue
-            dist_c = math.hypot(x - core_bx, y - core_by)
-            if dist_c < 3 or dist_c > min(hh, ww) * 0.7:
-                continue
-
-            # Sample 3 directions in a small circle of radius 2
-            r = 2
-            angles = []
-            for angle_deg in [0, 60, 120, 180, 240, 300]:
-                rad = math.radians(angle_deg)
-                sx = int(round(x + r * math.cos(rad)))
-                sy = int(round(y + r * math.sin(rad)))
-                if 0 <= sx < ww and 0 <= sy < hh and mask_block[sy, sx]:
-                    angles.append(theta[sy, sx])
-
-            if len(angles) >= 5:
-                # Angular dispersion
-                sins = np.sin(2 * np.array(angles))
-                coss = np.cos(2 * np.array(angles))
-                coherence = math.hypot(float(np.mean(sins)), float(np.mean(coss)))
-                # A true triradius has HIGH angular variance (LOW coherence) among neighbors
-                triradius_measure = 1.0 - coherence
-                
-                # Favor lateral displacement (left or right of core)
-                lateral_bonus = abs(x - core_bx) / float(ww)
-                score = triradius_measure * 0.7 + lateral_bonus * 0.3
-
-                if score > best_score:
-                    best_score = score
-                    best_pt = (x, y)
-
-    return best_pt
-
-
-def analyze(gray: np.ndarray, filename: str):
-    h, w = gray.shape
-    gray_enhanced = enhance(gray)
-
-    block = max(10, min(16, int(min(h, w) / 25)))
-    mask = extract_fingerprint_mask(gray_enhanced, block_size=block)
-    
-    # Downsample mask to block grid
-    hh, ww = h // block, w // block
-    mask_block = cv2.resize(mask, (ww, hh), interpolation=cv2.INTER_NEAREST) > 127
-
-    theta, energy, coherence, block = orientation_field(gray_enhanced, block=block)
-    raw_singularities = find_singularities(theta, mask_block, energy, coherence)
-    candidates = dedupe_singularities(raw_singularities, min_dist=2)
-
-    cx, cy = w / 2.0, h / 2.0
-    core_candidates = []
-    delta_candidates = []
-
-    for bx, by, is_core, quality, en, coh in candidates:
-        px = int((bx + 0.5) * block)
-        py = int((by + 0.5) * block)
-        if is_core:
-            core_candidates.append((px, py, bx, by, quality, en, coh))
-        else:
-            delta_candidates.append((px, py, bx, by, quality, en, coh))
-
-    # --- Pick Best Core ---
-    if core_candidates:
-        def core_rank(c):
-            # Prioritize upper center of foreground mask
-            dist_top_center = math.hypot((c[0] - cx) / w, (c[1] - cy * 0.75) / h)
-            return c[4] * 0.5 + max(0.0, 1.0 - dist_top_center * 1.5) * 0.5
-        core_candidates.sort(key=core_rank, reverse=True)
-        best_core = core_candidates[0]
-        core = (best_core[0], best_core[1], best_core[4])
-        core_bx, core_by = best_core[2], best_core[3]
+    mask0 = foreground_mask(enh, 8.0)
+    # ridge spacing is roughly (print width / 28); trust the FFT estimate only near that prior
+    ys0, xs0 = np.nonzero(mask0)
+    if len(ys0) > 100:
+        (_, _), (rw, rh), _ = cv2.minAreaRect(np.column_stack([xs0, ys0]).astype(np.float32))
+        prior = max(5.0, min(rw, rh) / 26.0)
     else:
-        # Fallback core at centroid of mask
-        coords = np.argwhere(mask_block)
-        if len(coords) > 0:
-            c_by, c_bx = np.mean(coords, axis=0)
-            c_by = max(2, c_by - 2)
-            core = (int(c_bx * block), int(c_by * block), 0.5)
-            core_bx, core_by = int(c_bx), int(c_by)
-        else:
-            core = (int(cx), int(cy * 0.75), 0.5)
-            core_bx, core_by = int(cx / block), int(cy * 0.75 / block)
+        prior = 8.0
+    p = float(np.clip(estimate_ridge_period(enh, mask0), 0.75 * prior, 1.3 * prior))
+    mask = foreground_mask(enh, p)
+    cores, deltas = multiscale_singularities(enh, mask, p)
 
-    # --- Pick Best Delta ---
+    ys, xs = np.nonzero(mask)
+    mcx = float(xs.mean()) if len(xs) else w / 2
+    top = float(ys.min()) if len(ys) else 0
+    bot = float(ys.max()) if len(ys) else h
+    span = max(1.0, bot - top)
+
+    # ---- core: strong, and nearer the upper-centre of the print
+    core = None
+    if cores:
+        def crank(c):
+            ypos = (c["y"] - top) / span
+            return c["strength"] - 0.6 * abs(c["x"] - mcx) / w - 0.5 * abs(ypos - 0.38)
+        core = max(cores, key=crank)
+
+    # ---- delta(s): below / beside the core and clearly separated from it
+    valid_deltas = []
+    for d in deltas:
+        if core is not None:
+            if math.hypot(d["x"] - core["x"], d["y"] - core["y"]) < 4.0 * p:
+                continue
+            if d["y"] < core["y"] - 2.0 * p:
+                continue
+        valid_deltas.append(d)
+
+    relaxed_used = False
+    if core is not None and not valid_deltas:
+        theta, coh = orientation_field(enh, p)
+        c2, _ = find_singularities(theta, coh, mask, p, relaxed=True)
+        dd = [d for d in cluster(c2, -1, 3.0 * p)
+              if math.hypot(d["x"] - core["x"], d["y"] - core["y"]) >= 4.0 * p and d["y"] >= core["y"] - 2.0 * p]
+        if dd:
+            valid_deltas = dd
+            relaxed_used = True
+
     delta = None
-    delta_count = 0
+    if valid_deltas and core is not None:
+        def drank(d):
+            dist = math.hypot(d["x"] - core["x"], d["y"] - core["y"]) / span
+            return d["strength"] - 0.5 * max(0.0, dist - 0.6)
+        delta = max(valid_deltas, key=drank)
 
-    if delta_candidates:
-        def delta_rank(d):
-            px, py = d[0], d[1]
-            dist_core = math.hypot(px - core[0], py - core[1])
-            if dist_core < 25:
-                return -1.0
-            # Delta should be lower or near level with core
-            y_weight = 1.0 if py >= core[1] - 10 else 0.4
-            # Lateral separation from core (loops have delta on one side)
-            x_sep = abs(px - core[0]) / float(w)
-            return d[4] * 0.4 + y_weight * 0.3 + min(1.0, x_sep * 3.0) * 0.3
-
-        delta_candidates.sort(key=delta_rank, reverse=True)
-        valid = [d for d in delta_candidates if delta_rank(d) > 0.2]
-        if valid:
-            delta = (valid[0][0], valid[0][1], valid[0][4])
-            delta_count = len(valid)
-
-    # If Poincaré missed the delta, use triradius triplet divergence
-    if delta is None:
-        tri_pt = detect_triradius_by_triplet(theta, mask_block, core_bx, core_by)
-        if tri_pt is not None:
-            delta = (int((tri_pt[0] + 0.5) * block), int((tri_pt[1] + 0.5) * block), 0.65)
-            delta_count = 1
-
-    # --- Classification & Ridge Count ---
-    if delta_count == 0:
-        pattern = "Arch"
-        pattern_code = "A"
-    elif delta_count == 1:
-        pattern = "Loop"
-        pattern_code = "L"
+    # ---- classification
+    # two deltas on opposite sides of the core axis => whorl
+    sides = {int(np.sign(d["x"] - core["x"])) for d in valid_deltas} if core else set()
+    if core is None or not valid_deltas:
+        n_delta = 0
+    elif len(valid_deltas) >= 2 and len(sides - {0}) == 2:
+        n_delta = 2
     else:
-        pattern = "Whorl"
-        pattern_code = "W"
+        n_delta = 1
 
-    if core and delta:
-        rc = local_ridge_count(gray_enhanced, (core[0], core[1]), (delta[0], delta[1]))
-        if pattern == "Loop" and rc < 5:
-            pattern = "Tented Arch"
-            pattern_code = "TA"
-        conf = min(0.96, max(0.55, 0.4 * core[2] + 0.4 * delta[2] + min(0.2, rc / 40.0)))
-        confidence = round(float(conf) * 100.0, 1)
-        status = "success" if rc >= 1 else "uncertain"
-    elif "Arch" in pattern:
-        rc = 0
-        confidence = 88.0
-        status = "success"
-    else:
-        rc = None
-        confidence = 50.0
+    status = "success"
+    if core is None:
+        pattern, code = "Unknown", "?"
         status = "uncertain"
+    elif n_delta == 0:
+        pattern, code = "Arch", "A"
+    elif n_delta == 1:
+        pattern, code = "Loop", "L"
+    else:
+        pattern, code = "Whorl", "W"
 
-    def pt(p):
-        return {"x": max(0, min(w - 1, int(p[0]))), "y": max(0, min(h - 1, int(p[1])))} if p else None
+    rc = None
+    conf = 50.0
+    if core is not None and delta is not None:
+        rc = ridge_count(enh, (core["x"], core["y"]), (delta["x"], delta["y"]), p)
+        if pattern == "Loop" and rc < 3:
+            pattern, code = "Tented Arch", "TA"
+        q = 0.5 * min(1.0, core["strength"] / 0.5) + 0.5 * min(1.0, delta["strength"] / 0.5)
+        conf = 55.0 + 41.0 * q
+        if relaxed_used:
+            conf = min(conf, 70.0)
+        if rc < 1:
+            status = "uncertain"
+    elif core is not None:
+        rc = 0
+        conf = 80.0
+    if core is None:
+        # nothing reliable: leave the markers for the manual editor instead of inventing a position
+        core_pt = None
+    else:
+        core_pt = core
+
+    def pt(d):
+        if d is None:
+            return None
+        return {"x": int(round(max(0, min(W - 1, d["x"] / scale)))), "y": int(round(max(0, min(H - 1, d["y"] / scale))))}
 
     return {
         "filename": filename,
-        "width": int(w),
-        "height": int(h),
-        "pattern": pattern,
-        "pattern_code": pattern_code,
-        "delta_count": delta_count,
-        "core": pt(core),
-        "delta": pt(delta),
+        "width": int(W), "height": int(H),
+        "pattern": pattern, "pattern_code": code,
+        "delta_count": n_delta,
+        "core": pt(core_pt), "delta": pt(delta),
         "ridge_count": rc,
-        "confidence": confidence,
+        "confidence": round(float(conf), 1),
         "status": status,
         "enhancement_attempted": True,
-        "retry_attempted": False,
+        "retry_attempted": relaxed_used,
     }
 
 
+# ---------------------------------------------------------------- API
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "fingerprint-analyzer"}
