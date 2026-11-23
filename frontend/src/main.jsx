@@ -118,12 +118,22 @@ function ResultCard({ finger, result, src, onEdit }) {
 
         {cX != null && dX != null && (
           <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none', zIndex: 2 }}>
-            <line x1={`${cX}%`} y1={`${cY}%`} x2={`${dX}%`} y2={`${dY}%`} stroke="#f2c900" strokeWidth="2.5" strokeDasharray="3 2" />
+            <line x1={`${cX}%`} y1={`${cY}%`} x2={`${dX}%`} y2={`${dY}%`} stroke="#fbbf24" strokeWidth="1.4" strokeDasharray="4 2" />
           </svg>
         )}
 
-        {cX != null && <span className="marker core" style={{ left: `${cX}%`, top: `${cY}%`, zIndex: 3 }}>C</span>}
-        {dX != null && <span className="marker delta" style={{ left: `${dX}%`, top: `${dY}%`, zIndex: 3 }}>D</span>}
+        {cX != null && (
+          <span className="marker core" style={{ left: `${cX}%`, top: `${cY}%`, zIndex: 3 }} title="Core (C)">
+            <span className="reticle-cross" />
+            <span className="marker-label">C</span>
+          </span>
+        )}
+        {dX != null && (
+          <span className="marker delta" style={{ left: `${dX}%`, top: `${dY}%`, zIndex: 3 }} title="Delta (D)">
+            <span className="reticle-cross" />
+            <span className="marker-label">D</span>
+          </span>
+        )}
         {editable && <span className="edit-hint">{icon('edit', 13)} Adjust</span>}
       </div>
       <div className="card-body">
@@ -245,11 +255,21 @@ function FingerEditor({ finger, result, src, defaultDims, hasOverride, onSave, o
             />
             {cX != null && dX != null && (
               <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="editor-line">
-                <line x1={`${cX}%`} y1={`${cY}%`} x2={`${dX}%`} y2={`${dY}%`} stroke="#f2c900" strokeWidth="2.5" strokeDasharray="3 2" />
+                <line x1={`${cX}%`} y1={`${cY}%`} x2={`${dX}%`} y2={`${dY}%`} stroke="#fbbf24" strokeWidth="1.4" strokeDasharray="4 2" />
               </svg>
             )}
-            {cX != null && <span className="marker core" style={{ left: `${cX}%`, top: `${cY}%` }}>C</span>}
-            {dX != null && <span className="marker delta" style={{ left: `${dX}%`, top: `${dY}%` }}>D</span>}
+            {cX != null && (
+              <span className="marker core" style={{ left: `${cX}%`, top: `${cY}%` }}>
+                <span className="reticle-cross" />
+                <span className="marker-label">C</span>
+              </span>
+            )}
+            {dX != null && (
+              <span className="marker delta" style={{ left: `${dX}%`, top: `${dY}%` }}>
+                <span className="reticle-cross" />
+                <span className="marker-label">D</span>
+              </span>
+            )}
           </div>
         </div>
 
